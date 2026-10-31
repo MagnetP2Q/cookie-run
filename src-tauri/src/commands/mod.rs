@@ -59,6 +59,10 @@ pub async fn start_bot(app: AppHandle, device: String) -> Result<(), String> {
         if i.status.state != "stopped" && i.status.state != "error" {
             return Err("บอทกำลังทำงานอยู่".into());
         }
+        if let Some(previous) = i.worker.take() {
+            // The previous worker has already published its terminal state.
+            let _ = previous.join();
+        }
         i.status = Status {
             state: "starting".into(),
             device: Some(device.clone()),
@@ -76,6 +80,9 @@ pub fn stop_bot(app: AppHandle, ctl: State<Controller>) -> Result<(), String> {
     let mut i = ctl.inner.lock().map_err(|e| e.to_string())?;
     if let Some(c) = &i.cancel {
         c.store(true, Ordering::SeqCst)
+    }
+    if let Some(worker) = &i.worker {
+        worker.thread().unpark();
     }
     if i.status.state == "running" || i.status.state == "starting" {
         i.status.state = "stopping".into();

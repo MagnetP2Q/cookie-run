@@ -39,5 +39,12 @@ dist-ssr
 .env
 .env.*
 !.env.example
-*.local
 *.bak
+
+# Local performance recordings
+/measurements/
+
+# Local crash and memory diagnostic dumps
+*.dmp
+*.hdmp
+*.mdmp
