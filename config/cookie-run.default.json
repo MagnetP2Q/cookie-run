@@ -1,0 +1,116 @@
+{
+  "interval_ms": 500,
+  "post_tap_ms": 1000,
+  "scale": 3,
+  "rules": [
+    {
+      "id": "box1",
+      "label": "Play!",
+      "rect": [
+        1091,
+        767,
+        1295,
+        847
+      ],
+      "action": {
+        "type": "tap",
+        "point": [
+          1195,
+          807
+        ]
+      },
+      "wait_ms": 1000
+    },
+    {
+      "id": "box2",
+      "label": "Play!",
+      "rect": [
+        1033,
+        724,
+        1204,
+        808
+      ],
+      "action": {
+        "type": "tap",
+        "point": [
+          1123,
+          764
+        ]
+      },
+      "wait_ms": 1000
+    },
+    {
+      "id": "box7",
+      "label": "Result",
+      "rect": [
+        646,
+        36,
+        954,
+        146
+      ],
+      "action": {
+        "type": "tap",
+        "point": [
+          580,
+          772
+        ]
+      },
+      "wait_ms": 1000
+    },
+    {
+      "id": "box8",
+      "label": "Mystery Box",
+      "rect": [
+        646,
+        36,
+        954,
+        146
+      ],
+      "action": {
+        "type": "tap",
+        "point": [
+          796,
+          804
+        ]
+      },
+      "wait_ms": 1000
+    },
+    {
+      "id": "box9",
+      "label": "Confirm",
+      "rect": [
+        678,
+        757,
+        924,
+        840
+      ],
+      "action": {
+        "type": "tap",
+        "point": [
+          793,
+          794
+        ]
+      },
+      "wait_ms": 1000
+    },
+    {
+      "id": "mini",
+      "label": "Surprise!",
+      "rect": [
+        494,
+        37,
+        1204,
+        118
+      ],
+      "action": {
+        "type": "minigame",
+        "region": [
+          427,
+          218,
+          1153,
+          848
+        ]
+      }
+    }
+  ]
+}
