@@ -248,6 +248,9 @@ export default function App() {
   const [device, setDevice] = useState("");
   const [path, setPath] = useState("");
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [logsReady, setLogsReady] = useState(false);
+  const [clearingLogs, setClearingLogs] = useState(false);
+  const clearInProgress = useRef(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -262,6 +265,20 @@ export default function App() {
       setError(String(e));
     } finally {
       setBusy(false);
+    }
+  };
+  const clearLogs = async () => {
+    if (clearInProgress.current) return;
+    clearInProgress.current = true;
+    setClearingLogs(true);
+    setError("");
+    try {
+      await backend.clearLogs();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      clearInProgress.current = false;
+      setClearingLogs(false);
     }
   };
   const refresh = async () => {
@@ -299,14 +316,34 @@ export default function App() {
           return;
         }
         unsubs.push(statusUnsub);
-        const logUnsub = await listen<LogEntry>("bot-log", (e) => {
-          if (active) setLogs((l) => [...l, e.payload].slice(-500));
+        let loading = true;
+        let pending: LogEntry[] = [];
+        const logUnsub = await listen<LogEntry>("cycle-log", (e) => {
+          if (!active) return;
+          if (loading) pending.push(e.payload);
+          else setLogs((items) => items.some((item) => item.id === e.payload.id) ? items : [...items, e.payload].slice(-100));
         });
-        if (!active) {
-          logUnsub();
-          return;
-        }
+        if (!active) { logUnsub(); return; }
         unsubs.push(logUnsub);
+        const clearUnsub = await listen("logs-cleared", () => {
+          if (active) { pending = []; setLogs([]); }
+        });
+        if (!active) { clearUnsub(); return; }
+        unsubs.push(clearUnsub);
+        const errorUnsub = await listen<string>("log-error", (e) => {
+          if (active) setError(e.payload);
+        });
+        if (!active) { errorUnsub(); return; }
+        unsubs.push(errorUnsub);
+        let history: LogEntry[] = [];
+        try { history = await backend.logs(); }
+        catch (e) { if (active) setError(`อ่าน log ไม่สำเร็จ: ${String(e)}`); }
+        if (active) {
+          const seen = new Set(history.map((entry) => entry.id));
+          setLogs([...history, ...pending.filter((entry) => !seen.has(entry.id))].slice(-100));
+          setLogsReady(true);
+        }
+        loading = false;
         const [s, c] = await Promise.all([
           backend.status(),
           backend.settings(),
@@ -316,7 +353,7 @@ export default function App() {
           setPath(c.adb_path);
         }
       } catch (e) {
-        if (active) setError(String(e));
+        if (active) { setError(String(e)); setLogsReady(true); }
       }
     };
     void subscribe();
@@ -469,7 +506,11 @@ export default function App() {
                     {statusLabel[status.state]}
                   </span>
                 </div>
-                <button className="clear-button" onClick={() => setLogs([])}>
+                <button
+                  className="clear-button"
+                  disabled={!logsReady || clearingLogs}
+                  onClick={() => void clearLogs()}
+                >
                   ล้าง log
                 </button>
               </div>
@@ -485,7 +526,6 @@ export default function App() {
                         <time>
                           {new Date(l.timestamp * 1000).toLocaleTimeString()}
                         </time>
-                        <b>{l.level}</b>
                         <span>{l.message}</span>
                       </div>
                     ))

@@ -12,7 +12,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager};
 #[derive(Clone, Serialize)]
@@ -20,12 +20,6 @@ pub struct Status {
     pub state: String,
     pub device: Option<String>,
     pub message: Option<String>,
-}
-#[derive(Clone, Serialize)]
-struct Log {
-    level: String,
-    message: String,
-    timestamp: u64,
 }
 pub struct Controller {
     pub inner: Mutex<Inner>,
@@ -61,17 +55,8 @@ fn status(app: &AppHandle, state: &str, device: Option<String>, message: Option<
     let _ = app.emit("bot-status", i.status.clone());
 }
 fn log(app: &AppHandle, level: &str, message: String) {
-    let _ = app.emit(
-        "bot-log",
-        Log {
-            level: level.into(),
-            message,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        },
-    );
+    app.state::<crate::logging::Logger>()
+        .write(level, message, false);
 }
 fn catch_worker_panic(f: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
@@ -130,6 +115,7 @@ pub fn start(app: AppHandle, device: String, path: String, cfg: Config, cancel: 
         } else {
             status(&app, "stopped", None, None)
         }
+        app.state::<crate::logging::Logger>().flush();
     });
     {
         let ctl = app.state::<Controller>();
@@ -147,6 +133,7 @@ trait BotIo {
     ) -> Result<bool, String>;
     fn act(&mut self, rule: &crate::config::Rule, cancel: &Arc<AtomicBool>) -> Result<(), String>;
     fn found(&mut self, rule: &crate::config::Rule);
+    fn cycle(&mut self, _number: u64) {}
 }
 
 struct RealIo<'a> {
@@ -180,6 +167,9 @@ impl BotIo for RealIo<'_> {
             image::imageops::FilterType::Lanczos3,
         );
         self.text = self.ocr.recognize(&crop)?;
+        if let Some(app) = self.app {
+            log(app, "INFO", format!("OCR {}: {}", rule.id, self.text));
+        }
         let matched = cookie_run::matches(&rule.label, &self.text);
         self.image = if matched && matches!(rule.action, Action::Minigame { .. }) {
             Some(img)
@@ -191,6 +181,12 @@ impl BotIo for RealIo<'_> {
     fn found(&mut self, rule: &crate::config::Rule) {
         if let Some(app) = self.app {
             log(app, "INFO", format!("พบ {}: {}", rule.label, self.text));
+        }
+    }
+    fn cycle(&mut self, number: u64) {
+        if let Some(app) = self.app {
+            app.state::<crate::logging::Logger>()
+                .write("INFO", format!("วนลูปครั้งที่ {number}"), true);
         }
     }
     fn act(&mut self, rule: &crate::config::Rule, cancel: &Arc<AtomicBool>) -> Result<(), String> {
@@ -233,6 +229,7 @@ fn work(
     )
 }
 fn run_loop(cfg: &Config, cancel: &Arc<AtomicBool>, io: &mut impl BotIo) -> Result<(), String> {
+    let mut cycle_count = 0_u64;
     let mut active: HashMap<String, bool> =
         cfg.rules.iter().map(|r| (r.id.clone(), true)).collect();
     while !cancel.load(Ordering::SeqCst) {
@@ -252,6 +249,10 @@ fn run_loop(cfg: &Config, cancel: &Arc<AtomicBool>, io: &mut impl BotIo) -> Resu
                     }
                     io.found(rule);
                     io.act(rule, cancel)?;
+                    if rule.id == "box2" && matches!(rule.action, Action::Tap { .. }) {
+                        cycle_count += 1;
+                        io.cycle(cycle_count);
+                    }
                     for (id, value) in &rule.states {
                         active.insert(id.clone(), *value);
                     }
@@ -301,6 +302,8 @@ mod tests {
         actions: Vec<(String, [u32; 2])>,
         cancel: Arc<AtomicBool>,
         fail: bool,
+        fail_tap: bool,
+        cycles: Vec<u64>,
     }
     impl BotIo for Fake {
         fn scan(&mut self, rule: &Rule, _: &Config, _: &Arc<AtomicBool>) -> Result<bool, String> {
@@ -317,7 +320,13 @@ mod tests {
                 .is_some_and(|target| *target == rule.id))
         }
         fn found(&mut self, _: &Rule) {}
+        fn cycle(&mut self, number: u64) {
+            self.cycles.push(number);
+        }
         fn act(&mut self, rule: &Rule, _: &Arc<AtomicBool>) -> Result<(), String> {
+            if self.fail_tap {
+                return Err("tap failed".into());
+            }
             if let Action::Tap { point } = rule.action {
                 self.actions.push((rule.id.clone(), point));
             } else {
@@ -337,7 +346,26 @@ mod tests {
             actions: vec![],
             cancel: Arc::new(AtomicBool::new(false)),
             fail: false,
+            fail_tap: false,
+            cycles: vec![],
         }
+    }
+    #[test]
+    fn counts_only_successful_box2_taps_and_resets_each_run() {
+        let cfg = defaults();
+        let mut io = fake(&["box1", "box2", "box7", "box2"]);
+        run_loop(&cfg, &io.cancel.clone(), &mut io).unwrap();
+        assert_eq!(io.cycles, vec![1, 2]);
+        let mut next = fake(&["box2"]);
+        run_loop(&cfg, &next.cancel.clone(), &mut next).unwrap();
+        assert_eq!(next.cycles, vec![1]);
+        let mut failed = fake(&["box2"]);
+        failed.fail_tap = true;
+        assert_eq!(
+            run_loop(&cfg, &failed.cancel.clone(), &mut failed).unwrap_err(),
+            "tap failed"
+        );
+        assert!(failed.cycles.is_empty());
     }
     #[test]
     fn all_five_tap_rules_work_across_repeated_cycles() {
@@ -718,5 +746,22 @@ mod integration_fixtures {
             "soak stopped before duration"
         );
         assert!(scans.load(Ordering::Relaxed) > 0);
+    }
+}
+
+pub fn stop_and_join(app: &AppHandle) {
+    let worker = {
+        let ctl = app.state::<Controller>();
+        let mut inner = ctl.inner.lock().unwrap();
+        if let Some(cancel) = &inner.cancel {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        if let Some(worker) = &inner.worker {
+            worker.thread().unpark();
+        }
+        inner.worker.take()
+    };
+    if let Some(worker) = worker {
+        let _ = worker.join();
     }
 }

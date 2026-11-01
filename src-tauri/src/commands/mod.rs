@@ -91,3 +91,16 @@ pub fn stop_bot(app: AppHandle, ctl: State<Controller>) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[tauri::command]
+pub async fn get_cycle_logs(app: AppHandle) -> Result<Vec<crate::logging::Entry>, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<crate::logging::Logger>().read())
+        .await
+        .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+pub async fn clear_logs(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<crate::logging::Logger>().clear())
+        .await
+        .map_err(|e| e.to_string())?
+}
