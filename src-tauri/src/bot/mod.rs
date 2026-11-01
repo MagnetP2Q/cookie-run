@@ -12,7 +12,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager};
 #[derive(Clone, Serialize)]
@@ -21,18 +21,13 @@ pub struct Status {
     pub device: Option<String>,
     pub message: Option<String>,
 }
-#[derive(Clone, Serialize)]
-struct Log {
-    level: String,
-    message: String,
-    timestamp: u64,
-}
 pub struct Controller {
     pub inner: Mutex<Inner>,
 }
 pub struct Inner {
     pub status: Status,
     pub cancel: Option<Arc<AtomicBool>>,
+    pub worker: Option<thread::JoinHandle<()>>,
 }
 impl Default for Controller {
     fn default() -> Self {
@@ -44,6 +39,7 @@ impl Default for Controller {
                     message: None,
                 },
                 cancel: None,
+                worker: None,
             }),
         }
     }
@@ -59,32 +55,36 @@ fn status(app: &AppHandle, state: &str, device: Option<String>, message: Option<
     let _ = app.emit("bot-status", i.status.clone());
 }
 fn log(app: &AppHandle, level: &str, message: String) {
-    let _ = app.emit(
-        "bot-log",
-        Log {
-            level: level.into(),
-            message,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        },
-    );
+    app.state::<crate::logging::Logger>()
+        .write(level, message, false);
+}
+fn catch_worker_panic(f: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|_| Err("บอทหยุดเนื่องจากข้อผิดพลาดภายใน".to_string()))
 }
 fn pause(c: &AtomicBool, ms: u64) -> bool {
     let until = Instant::now() + Duration::from_millis(ms);
-    while Instant::now() < until {
-        if c.load(Ordering::SeqCst) {
-            return false;
+    while !c.load(Ordering::SeqCst) {
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
         }
-        thread::sleep(
-            Duration::from_millis(25).min(until.saturating_duration_since(Instant::now())),
-        )
+        // stop_bot unparks this worker; spurious wakes do not shorten the delay.
+        thread::park_timeout(remaining);
     }
-    !c.load(Ordering::SeqCst)
+    false
 }
+
 pub fn start(app: AppHandle, device: String, path: String, cfg: Config, cancel: Arc<AtomicBool>) {
-    thread::spawn(move || {
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(0);
+    let worker_app = app.clone();
+    let worker_cancel = cancel.clone();
+    let handle = thread::spawn(move || {
+        if ready_rx.recv().is_err() {
+            return;
+        }
+        let app = worker_app;
+        let cancel = worker_cancel;
         {
             let ctl = app.state::<Controller>();
             let mut i = ctl.inner.lock().unwrap();
@@ -105,7 +105,7 @@ pub fn start(app: AppHandle, device: String, path: String, cfg: Config, cancel: 
             let _ = app.emit("bot-status", i.status.clone());
         }
         log(&app, "INFO", format!("เริ่มทำงานบน {device}"));
-        let result = work(&app, &device, &path, cfg, &cancel);
+        let result = catch_worker_panic(|| work(&app, &device, &path, cfg, &cancel));
         if cancel.load(Ordering::SeqCst) {
             status(&app, "stopped", None, None);
             log(&app, "INFO", "หยุดบอทแล้ว".into())
@@ -115,7 +115,14 @@ pub fn start(app: AppHandle, device: String, path: String, cfg: Config, cancel: 
         } else {
             status(&app, "stopped", None, None)
         }
+        app.state::<crate::logging::Logger>().flush();
     });
+    {
+        let ctl = app.state::<Controller>();
+        let mut inner = ctl.inner.lock().unwrap();
+        inner.worker = Some(handle);
+    }
+    let _ = ready_tx.send(());
 }
 trait BotIo {
     fn scan(
@@ -126,6 +133,7 @@ trait BotIo {
     ) -> Result<bool, String>;
     fn act(&mut self, rule: &crate::config::Rule, cancel: &Arc<AtomicBool>) -> Result<(), String>;
     fn found(&mut self, rule: &crate::config::Rule);
+    fn cycle(&mut self, _number: u64) {}
 }
 
 struct RealIo<'a> {
@@ -159,8 +167,15 @@ impl BotIo for RealIo<'_> {
             image::imageops::FilterType::Lanczos3,
         );
         self.text = self.ocr.recognize(&crop)?;
+        if let Some(app) = self.app {
+            log(app, "INFO", format!("OCR {}: {}", rule.id, self.text));
+        }
         let matched = cookie_run::matches(&rule.label, &self.text);
-        self.image = Some(img);
+        self.image = if matched && matches!(rule.action, Action::Minigame { .. }) {
+            Some(img)
+        } else {
+            None
+        };
         Ok(matched)
     }
     fn found(&mut self, rule: &crate::config::Rule) {
@@ -168,12 +183,18 @@ impl BotIo for RealIo<'_> {
             log(app, "INFO", format!("พบ {}: {}", rule.label, self.text));
         }
     }
+    fn cycle(&mut self, number: u64) {
+        if let Some(app) = self.app {
+            app.state::<crate::logging::Logger>()
+                .write("INFO", format!("วนลูปครั้งที่ {number}"), true);
+        }
+    }
     fn act(&mut self, rule: &crate::config::Rule, cancel: &Arc<AtomicBool>) -> Result<(), String> {
         match rule.action {
             Action::Tap { point } => adb::tap(self.path, self.device, point, cancel)?,
             Action::Minigame { region } => {
-                let image = self.image.as_ref().ok_or("ไม่พบภาพมินิเกม")?;
-                for point in cookie_run::odd_cards(image, region) {
+                let image = self.image.take().ok_or("ไม่พบภาพมินิเกม")?;
+                for point in cookie_run::odd_cards(&image, region) {
                     if cancel.load(Ordering::SeqCst) {
                         return Ok(());
                     }
@@ -208,6 +229,7 @@ fn work(
     )
 }
 fn run_loop(cfg: &Config, cancel: &Arc<AtomicBool>, io: &mut impl BotIo) -> Result<(), String> {
+    let mut cycle_count = 0_u64;
     let mut active: HashMap<String, bool> =
         cfg.rules.iter().map(|r| (r.id.clone(), true)).collect();
     while !cancel.load(Ordering::SeqCst) {
@@ -227,6 +249,10 @@ fn run_loop(cfg: &Config, cancel: &Arc<AtomicBool>, io: &mut impl BotIo) -> Resu
                     }
                     io.found(rule);
                     io.act(rule, cancel)?;
+                    if rule.id == "box2" && matches!(rule.action, Action::Tap { .. }) {
+                        cycle_count += 1;
+                        io.cycle(cycle_count);
+                    }
                     for (id, value) in &rule.states {
                         active.insert(id.clone(), *value);
                     }
@@ -276,6 +302,8 @@ mod tests {
         actions: Vec<(String, [u32; 2])>,
         cancel: Arc<AtomicBool>,
         fail: bool,
+        fail_tap: bool,
+        cycles: Vec<u64>,
     }
     impl BotIo for Fake {
         fn scan(&mut self, rule: &Rule, _: &Config, _: &Arc<AtomicBool>) -> Result<bool, String> {
@@ -292,7 +320,13 @@ mod tests {
                 .is_some_and(|target| *target == rule.id))
         }
         fn found(&mut self, _: &Rule) {}
+        fn cycle(&mut self, number: u64) {
+            self.cycles.push(number);
+        }
         fn act(&mut self, rule: &Rule, _: &Arc<AtomicBool>) -> Result<(), String> {
+            if self.fail_tap {
+                return Err("tap failed".into());
+            }
             if let Action::Tap { point } = rule.action {
                 self.actions.push((rule.id.clone(), point));
             } else {
@@ -312,7 +346,26 @@ mod tests {
             actions: vec![],
             cancel: Arc::new(AtomicBool::new(false)),
             fail: false,
+            fail_tap: false,
+            cycles: vec![],
         }
+    }
+    #[test]
+    fn counts_only_successful_box2_taps_and_resets_each_run() {
+        let cfg = defaults();
+        let mut io = fake(&["box1", "box2", "box7", "box2"]);
+        run_loop(&cfg, &io.cancel.clone(), &mut io).unwrap();
+        assert_eq!(io.cycles, vec![1, 2]);
+        let mut next = fake(&["box2"]);
+        run_loop(&cfg, &next.cancel.clone(), &mut next).unwrap();
+        assert_eq!(next.cycles, vec![1]);
+        let mut failed = fake(&["box2"]);
+        failed.fail_tap = true;
+        assert_eq!(
+            run_loop(&cfg, &failed.cancel.clone(), &mut failed).unwrap_err(),
+            "tap failed"
+        );
+        assert!(failed.cycles.is_empty());
     }
     #[test]
     fn all_five_tap_rules_work_across_repeated_cycles() {
@@ -374,6 +427,35 @@ mod tests {
         handle.join().unwrap();
         assert!(io.scans.len() >= 2);
         assert!(io.actions.is_empty());
+    }
+    #[test]
+    fn worker_panic_becomes_error() {
+        assert_eq!(
+            catch_worker_panic(|| panic!("simulated worker panic")).unwrap_err(),
+            "บอทหยุดเนื่องจากข้อผิดพลาดภายใน"
+        );
+        assert_eq!(
+            catch_worker_panic(|| Err("ocr failed".into())).unwrap_err(),
+            "ocr failed"
+        );
+    }
+    #[test]
+    fn stop_unparks_long_wait_promptly() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            done_tx.send(pause(&worker_cancel, 10_000)).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        cancel.store(true, Ordering::SeqCst);
+        worker.thread().unpark();
+        assert!(!done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("stop must wake worker"));
+        worker.join().unwrap();
     }
     #[test]
     fn capture_error_stops_without_tapping() {
@@ -556,5 +638,130 @@ mod integration_fixtures {
             "real OCR, simulated taps: {:?}, scans={}",
             io.actions, io.scans
         );
+    }
+    struct SoakIo {
+        cfg_dir: std::path::PathBuf,
+        stage: usize,
+        scans: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        actions: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        ocr: WindowsOcr,
+    }
+    impl BotIo for SoakIo {
+        fn scan(
+            &mut self,
+            rule: &Rule,
+            cfg: &Config,
+            cancel: &Arc<AtomicBool>,
+        ) -> Result<bool, String> {
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
+            let targets = ["box1", "box2", "box7", "box8", "box9"];
+            let img = image::open(self.cfg_dir.join(format!("{}.png", targets[self.stage])))
+                .map_err(|e| e.to_string())?;
+            let [l, t, r, b] = rule.rect;
+            let crop = img.crop_imm(l, t, r - l, b - t).resize_exact(
+                (r - l) * cfg.scale,
+                (b - t) * cfg.scale,
+                image::imageops::FilterType::Lanczos3,
+            );
+            let text = self.ocr.recognize(&crop)?;
+            self.scans.fetch_add(1, Ordering::Relaxed);
+            Ok(cookie_run::matches(&rule.label, &text))
+        }
+        fn found(&mut self, _: &Rule) {}
+        fn act(&mut self, rule: &Rule, _: &Arc<AtomicBool>) -> Result<(), String> {
+            let targets = ["box1", "box2", "box7", "box8", "box9"];
+            if rule.id != targets[self.stage] {
+                return Err(format!("unexpected fixture action: {}", rule.id));
+            }
+            self.actions.fetch_add(1, Ordering::Relaxed);
+            self.stage = (self.stage + 1) % targets.len();
+            Ok(())
+        }
+    }
+    #[test]
+    #[ignore = "long-running Windows OCR fixture soak; no emulator taps"]
+    fn fixture_soak_real_ocr_no_taps() {
+        use std::sync::atomic::AtomicU64;
+        let secs = std::env::var("COOKIE_RUN_SOAK_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(86400);
+        assert!(
+            (1..=259200).contains(&secs),
+            "soak duration must be 1..259200 seconds"
+        );
+        let cfg: Config =
+            serde_json::from_str(include_str!("../../../config/cookie-run.default.json")).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let scans = Arc::new(AtomicU64::new(0));
+        let actions = Arc::new(AtomicU64::new(0));
+        let test_thread = std::thread::current();
+        let (timer_cancel, timer_done, timer_scans, timer_actions) =
+            (cancel.clone(), done.clone(), scans.clone(), actions.clone());
+        let timer = std::thread::spawn(move || {
+            let started = Instant::now();
+            println!("FIXTURE_SOAK_START duration_seconds={secs}");
+            while !timer_done.load(Ordering::SeqCst)
+                && started.elapsed() < Duration::from_secs(secs)
+            {
+                std::thread::park_timeout(
+                    Duration::from_secs(60)
+                        .min(Duration::from_secs(secs).saturating_sub(started.elapsed())),
+                );
+                println!(
+                    "FIXTURE_SOAK_PROGRESS elapsed_seconds={} scans={} actions={}",
+                    started.elapsed().as_secs(),
+                    timer_scans.load(Ordering::Relaxed),
+                    timer_actions.load(Ordering::Relaxed)
+                );
+            }
+            if !timer_done.load(Ordering::SeqCst) {
+                timer_cancel.store(true, Ordering::SeqCst);
+                test_thread.unpark();
+            }
+        });
+        let mut io = SoakIo {
+            cfg_dir: std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/ocr-fixtures"),
+            stage: 0,
+            scans: scans.clone(),
+            actions: actions.clone(),
+            ocr: WindowsOcr,
+        };
+        let result = run_loop(&cfg, &cancel, &mut io);
+        done.store(true, Ordering::SeqCst);
+        timer.thread().unpark();
+        timer.join().unwrap();
+        println!(
+            "FIXTURE_SOAK_END scans={} actions={} completed_duration={}",
+            scans.load(Ordering::Relaxed),
+            actions.load(Ordering::Relaxed),
+            cancel.load(Ordering::SeqCst)
+        );
+        result.unwrap();
+        assert!(
+            cancel.load(Ordering::SeqCst),
+            "soak stopped before duration"
+        );
+        assert!(scans.load(Ordering::Relaxed) > 0);
+    }
+}
+
+pub fn stop_and_join(app: &AppHandle) {
+    let worker = {
+        let ctl = app.state::<Controller>();
+        let mut inner = ctl.inner.lock().unwrap();
+        if let Some(cancel) = &inner.cancel {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        if let Some(worker) = &inner.worker {
+            worker.thread().unpark();
+        }
+        inner.worker.take()
+    };
+    if let Some(worker) = worker {
+        let _ = worker.join();
     }
 }

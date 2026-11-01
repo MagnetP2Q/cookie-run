@@ -24,7 +24,7 @@ Rust tests are colocated with their modules under `#[cfg(test)]`; name tests des
 
 ## Commits & Pull Requests
 
-Use concise, imperative commit subjects describing the change. Git history was unavailable in this checkout, so no existing convention could be verified. Pull requests should explain the behavior changed, list verification commands and results, link relevant issues, and include screenshots for interface changes.
+Use concise, imperative commit subjects describing the change. The current history contains an initial commit; no established commit convention has been verified. Pull requests should explain the behavior changed, list verification commands and results, link relevant issues, and include screenshots for interface changes.
 
 ## Configuration & Packaging
 

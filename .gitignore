@@ -1,6 +1,8 @@
 # Logs
 logs
 *.log
+# Runtime logs, including cookie.log.1 and cookie.log.2
+cookie.log.[0-9]*
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -39,5 +41,12 @@ dist-ssr
 .env
 .env.*
 !.env.example
-*.local
 *.bak
+
+# Local performance recordings
+/measurements/
+
+# Local crash and memory diagnostic dumps
+*.dmp
+*.hdmp
+*.mdmp
