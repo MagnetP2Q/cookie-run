@@ -5,6 +5,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { backend } from "../lib/backend";
 import type { BotStatus, LogEntry, DeviceInfo } from "../types";
 
+const logTimeFormatter = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Asia/Bangkok",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hourCycle: "h23",
+});
+
 type IconName =
   | "settings"
   | "refresh"
@@ -524,7 +532,7 @@ export default function App() {
                     .map((l, i) => (
                       <div className="log-entry" key={i}>
                         <time>
-                          {new Date(l.timestamp * 1000).toLocaleTimeString()}
+                          {logTimeFormatter.format(new Date(l.timestamp * 1000))}
                         </time>
                         <span>{l.message}</span>
                       </div>

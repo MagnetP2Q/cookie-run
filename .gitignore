@@ -1,7 +1,7 @@
 # Logs
 logs
 *.log
-# Rotated application logs (runtime data)
+# Runtime logs, including cookie.log.1 and cookie.log.2
 cookie.log.[0-9]*
 npm-debug.log*
 yarn-debug.log*
